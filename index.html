@@ -974,8 +974,11 @@ function migrateState(){
                                     lastBalanceDate if we have it
 --------------------------------------------------------- */
 function migrateToV4(){
-  if(num(state.schemaVersion) >= 4 && Array.isArray(state.txns) && state.txns.length >= 0 && state.__v4done) return;
-
+  /* No early return. The bulk v3 conversion below guards itself with
+     `alreadyMigrated`, and the rescue sweep at the end matches on content, so
+     both are safe to run on every load — which is what makes the rescue able
+     to catch records written AFTER the first migration ran. An early return
+     here is precisely why stranded imports stayed invisible. */
   if(!Array.isArray(state.accounts)) state.accounts = [];
   if(!Array.isArray(state.obligations)) state.obligations = [];
   if(!Array.isArray(state.txns)) state.txns = [];
@@ -1100,6 +1103,75 @@ function migrateToV4(){
     }
     return o;
   });
+  /* RECOVERY: rescue records written into the v3 arrays AFTER the first
+     migration ran. A build of the importer kept writing v3 shapes while every
+     screen had already moved to txns/obligations, so imports landed in storage
+     nothing displayed. The one-shot `alreadyMigrated` guard above deliberately
+     won't touch them, so they are swept up here instead — matched by content,
+     so nothing is converted twice. */
+  (function rescueStrayV3(){
+    const items = Array.isArray(state.expenses && state.expenses.items) ? state.expenses.items : [];
+    const log = (state.expenses && isPlainObject(state.expenses.monthlyLog)) ? state.expenses.monthlyLog : {};
+    let rescued = 0;
+    items.forEach(item=>{
+      if(item.frequency === 'onetime'){
+        const already = state.txns.some(t=>
+          t.kind==='expense' && t.date===item.date &&
+          Math.round(num(t.amount)*100)===Math.round(num(item.amount)*100) &&
+          nameSimilarity(t.merchantKey||'', merchantKey(item.name)) >= 0.6);
+        if(already) return;
+        state.txns.push({ id: uid(), date: item.date, name: item.name,
+          merchantKey: merchantKey(item.name), amount: round2(item.amount),
+          kind:'expense', payment:'cash', accountId: defaultCash.id,
+          category: ALL_CATS.includes(item.category) ? item.category : ONETIME_CAT,
+          memberId: item.memberId || null, obligationId: null, source:'v3-rescued' });
+        rescued++;
+      } else if(!state.obligations.some(o=>o.id === item.id)){
+        state.obligations.push({ id:item.id, name:item.name, merchantKey:merchantKey(item.name),
+          category: ALL_CATS.includes(item.category) ? item.category : 'Misc',
+          amount: round2(item.amount),
+          frequency: item.frequency === 'variable' ? 'variable' : item.frequency,
+          isBudget: item.frequency === 'variable', variableAmount: item.frequency === 'variable',
+          dueDay: item.dueDay || null, anchorDate: item.anchorDate || null,
+          annualMonth: null, annualDay: null, payment:'cash', accountId: defaultCash.id,
+          startDate: item.startDate || null, endDate: item.endDate || null,
+          status: item.status === 'cancelled' ? 'cancelled' : (item.status === 'flagged' ? 'flagged' : 'active'),
+          memberId: item.memberId || null });
+        rescued++;
+      }
+    });
+    Object.keys(log).forEach(key=>{
+      const [obId, occ] = key.split('|');
+      if(!isValidISO(occ)) return;
+      const ob = state.obligations.find(o=>o.id === obId);
+      if(!ob) return;
+      if(state.txns.some(t=>t.obligationId===obId && t.date===occ)) return;
+      state.txns.push({ id: uid(), date: occ, name: ob.name, merchantKey: ob.merchantKey,
+        amount: round2(log[key]), kind:'expense', payment: ob.payment || 'cash',
+        accountId: ob.accountId || defaultCash.id, category: ob.category,
+        memberId: ob.memberId || null, obligationId: ob.id, source:'v3-rescued' });
+      rescued++;
+    });
+    const pushIncomeIfNew = (date, name, amount, type, jobPeriodId)=>{
+      if(!isValidISO(date)) return;
+      const cents = Math.round(num(amount)*100);
+      if(state.txns.some(t=>t.kind==='income' && t.date===date && Math.round(num(t.amount)*100)===cents)) return;
+      state.txns.push({ id: uid(), date, name, merchantKey: merchantKey(name),
+        amount: round2(amount), kind:'income', payment:'cash', accountId: defaultCash.id,
+        category:'Income', memberId:null, obligationId:null, incomeType:type,
+        jobPeriodId: jobPeriodId || null, source:'v3-rescued' });
+      rescued++;
+    };
+    (state.sideGig.entries||[]).forEach(e=> pushIncomeIfNew(e.date, e.source||'Side gig', e.amount, 'sidegig'));
+    (state.otherIncome.entries||[]).forEach(e=> pushIncomeIfNew(e.date, e.label||'Other income', e.amount, 'other'));
+    (state.job.periods||[]).forEach(p=>{
+      if(p.actualNet == null || p.actualNet === '') return;
+      if(state.txns.some(t=>t.jobPeriodId === p.id)) return;
+      pushIncomeIfNew(p.payDate, 'Paycheque', p.actualNet, 'job', p.id);
+    });
+    if(rescued) console.log('recovered ' + rescued + ' record(s) that had been written to the old storage');
+  })();
+
   /* The manual "current savings" box is gone: savings is derived from Stored
      Cash now. Removed only here, after the baseline above has read it. */
   state.goals.forEach(g=>{
@@ -4341,58 +4413,93 @@ function renderDocReviewStep(body, close, rows){
        contain text addressed to the extractor. Amounts, dates and names are
        re-coerced here rather than trusted, and nothing is written to a field
        the review table didn't show the user. */
-    let added = 0;
+    /* Writes v4 records: transactions and obligations. This used to push into
+       the old expenses.items / sideGig.entries arrays, which nothing reads any
+       more — so an import "succeeded" and then appeared nowhere. */
+    let added = 0, skipped = 0, matched = 0, newObligations = 0;
     checked.filter(row => !amountInvalid(row)).forEach(row=>{
-      const amount = round2(row.amount);
+      const amount = Math.abs(round2(row.amount));
       const date = isValidISO(row.date) ? row.date : todayISO();
       const desc = String(row.description||'').trim().slice(0,200);
-      if(row.destination==='expense'){
-        const looksRecurring = row.frequency==='monthly' || row.frequency==='biweekly';
-        const existing = looksRecurring ? findExistingRecurringItem(row) : null;
-        if(existing){
-          // Same subscription/bill we already have — log this payment against
-          // it instead of creating a duplicate. The key must be the item's real
-          // due date: keying on the posting date produced entries that no
-          // reader ever looked up, so the payment was invisible in history and
-          // the month silently kept using the estimate.
-          state.expenses.monthlyLog[logKey(existing.id, nearestOccurrence(existing, date))] = amount;
-        } else {
-          const dueDay = parseISO(date) ? parseISO(date).getDate() : 1;
-          const newItem = {
-            id:uid(), name: desc || 'Untitled expense', category: ALL_CATS.includes(row.category) ? row.category : ONETIME_CAT,
-            amount, frequency: ['monthly','biweekly','onetime'].includes(row.frequency) ? row.frequency : 'onetime',
-            dueDay: row.frequency==='monthly' ? dueDay : null,
-            anchorDate: row.frequency==='biweekly' ? date : null,
-            date: row.frequency==='onetime' ? date : null,
-            // An imported bill starts the month it was first seen, not at the
-            // beginning of recorded history.
-            startDate: row.frequency==='onetime' ? null : monthKey(date)+'-01',
-            endDate:null, memberId:null, status:"active"
+      const cashAcct = state.accounts.find(a=>a.kind==='cash' && !a.archived) || state.accounts[0];
+      const creditAcct = state.accounts.find(a=>a.kind==='credit' && !a.archived);
+      const payment = row.payment === 'credit' ? 'credit' : 'cash';
+      const account = payment === 'credit' ? (creditAcct || cashAcct) : cashAcct;
+
+      if(row.destination === 'expense'){
+        const txn = {
+          id: uid(), date, name: desc || 'Expense', merchantKey: merchantKey(desc),
+          amount, kind: 'expense', payment,
+          accountId: account ? account.id : null,
+          category: ALL_CATS.includes(row.category) ? row.category : ONETIME_CAT,
+          memberId: null, obligationId: null, source: 'import'
+        };
+        applyEnrichment(txn);                       // canonical key + category, if known
+        if(isDuplicateTxn(txn)){ skipped++; return; }
+
+        /* Does this satisfy an obligation we already track? Scored on name,
+           amount and cadence against the WHOLE history, not just this import. */
+        const hit = findObligationForTxn(txn);
+        if(hit){
+          txn.obligationId = hit.obligation.id;
+          txn.date = nearestOccurrence(hit.obligation, date);
+          matched++;
+        } else if(row.frequency === 'monthly' || row.frequency === 'biweekly' || row.frequency === 'yearly'){
+          // Looks like a commitment we don't have yet: create the obligation
+          // AND the transaction that satisfies this instance of it.
+          const d = parseISO(date);
+          const ob = {
+            id: uid(), name: desc || 'Recurring expense', merchantKey: txn.merchantKey,
+            category: txn.category, amount, frequency: row.frequency, isBudget: false,
+            variableAmount: false,
+            dueDay: row.frequency === 'monthly' ? d.getDate() : null,
+            anchorDate: row.frequency === 'biweekly' ? date : null,
+            annualMonth: row.frequency === 'yearly' ? d.getMonth()+1 : null,
+            annualDay:   row.frequency === 'yearly' ? d.getDate() : null,
+            payment, accountId: txn.accountId,
+            startDate: monthKey(date)+'-01', endDate: null,
+            status: 'active', memberId: null
           };
-          state.expenses.items.push(newItem);
-          if(looksRecurring) state.expenses.monthlyLog[logKey(newItem.id, date)] = amount;
+          state.obligations.push(ob);
+          txn.obligationId = ob.id;
+          newObligations++;
         }
-      } else if(row.destination==='sidegig'){
-        const src = String(row.source||'Other').trim().slice(0,60) || 'Other';
-        state.sideGig.entries.push({ id:uid(), date, source:src, amount, notes:'', memberId:null });
-        // Capped and coerced: this list is rendered in every source dropdown,
-        // and the extractor could otherwise grow it without bound.
-        if(!state.sideGig.sources.includes(src) && state.sideGig.sources.length < 50) state.sideGig.sources.push(src);
-      } else if(row.destination==='otherincome'){
-        state.otherIncome.entries.push({ id:uid(), date, label: desc || 'Other income', amount, memberId:null, notes:'' });
-        state.settings.otherIncomeEnabled = true;
-      } else if(row.destination==='job'){
+        state.txns.push(txn);
+        added++;
+
+      } else if(row.destination === 'sidegig' || row.destination === 'otherincome'){
+        const isGig = row.destination === 'sidegig';
+        const txn = {
+          id: uid(), date,
+          name: (isGig ? (String(row.source||'').trim() || desc) : desc) || 'Income',
+          merchantKey: merchantKey(desc || row.source || 'income'),
+          amount, kind: 'income', payment: 'cash',
+          accountId: cashAcct ? cashAcct.id : null, category: 'Income',
+          incomeType: isGig ? 'sidegig' : 'other', memberId: null, source: 'import'
+        };
+        if(isDuplicateTxn(txn)){ skipped++; return; }
+        state.txns.push(txn);
+        if(!isGig) state.settings.otherIncomeEnabled = true;
+        added++;
+
+      } else if(row.destination === 'job'){
         const payDate = isValidISO(row.payDate) ? row.payDate : date;
-        state.job.periods.push({
-          id:uid(),
+        /* A pay stub is a schedule entry AND the money it paid. Create the
+           period, then let the one sync function create its income
+           transaction, so a paycheque can never be counted twice. */
+        const existingPeriod = state.job.periods.find(p=>
+          inRange(p.payDate, addDays(payDate,-3), addDays(payDate,3)));
+        const period = existingPeriod || { id: uid(), payDate,
           start: isValidISO(row.periodStart) ? row.periodStart : payDate,
           end:   isValidISO(row.periodEnd)   ? row.periodEnd   : payDate,
-          payDate,
-          hours: num(row.hours) > 0 ? num(row.hours) : null,
-          actualNet: amount, notes:'', memberId: state.members[0]?state.members[0].id:null
-        });
+          hours: null, actualNet: null, notes: '',
+          memberId: state.members[0] ? state.members[0].id : null };
+        period.actualNet = amount;
+        if(num(row.hours) > 0) period.hours = num(row.hours);
+        if(!existingPeriod) state.job.periods.push(period);
+        syncJobPeriodTxn(period);
+        added++;
       }
-      added++;
     });
     /* `balance_after` is deliberately NOT applied here. It is the one extracted
        field the review table never showed and never let the user edit, and it
@@ -4405,7 +4512,11 @@ function renderDocReviewStep(body, close, rows){
       .sort((a,b)=> a.date.localeCompare(b.date));
     state.pendingDocReview = null;
     scheduleSave(); close(); render();
-    toast('Added ' + added + ' transaction' + (added===1?'':'s'), {kind:'ok'});
+    const bits = [added + ' transaction' + (added===1?'':'s') + ' added'];
+    if(matched) bits.push(matched + ' matched to a recurring bill');
+    if(newObligations) bits.push(newObligations + ' new recurring bill' + (newObligations===1?'':'s'));
+    if(skipped) bits.push(skipped + ' skipped as duplicates');
+    toast(bits.join(' · '), {kind:'ok', ms: 7000});
     if(balances.length && state.goals.length) offerDetectedBalance(balances[balances.length-1]);
   });
 }
